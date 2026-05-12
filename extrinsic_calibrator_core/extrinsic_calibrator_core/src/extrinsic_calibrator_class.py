@@ -54,16 +54,13 @@ import numpy as np
 from prettytable import PrettyTable
 
 # ROS-specific imports
-from cv_bridge import CvBridge
 from geometry_msgs.msg import TransformStamped
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 from sensor_msgs.msg import CameraInfo, Image
 import tf2_ros
-import tf_transformations
-
-# Custom parameters
-from extrinsic_calibrator_core.python_aruco_parameters import aruco_params
-from extrinsic_calibrator_core.python_camera_topics_parameters import cameras_params
+from scipy.spatial.transform import Rotation
 
 
 
@@ -74,30 +71,40 @@ class ExtrinsicCalibrator(Node):
         # TF broadcaster
         self.tf_broadcaster = tf2_ros.StaticTransformBroadcaster(self)
 
-        # OpenCV bridge for converting ROS Image to OpenCV image
-        self.bridge = CvBridge()
-        
-        aruco_params_listener = aruco_params.ParamListener(self)
-        imported_aruco_params = aruco_params_listener.get_params()
-        self.real_aruco_params = ArucoParams(self,imported_aruco_params)
-        
-        cameras_param_listener = cameras_params.ParamListener(self)
-        self.imported_cameras_params = cameras_param_listener.get_params()
-        
-        # Get all cameras, filtering out those that start or end with '_'
-        cam_attributes = [attr for attr in dir(self.imported_cameras_params) if not (attr.startswith('_') or attr.endswith('_'))]
-        
-        # construct the cameras
+        # Configurable frame naming for TF broadcast
+        self.declare_parameter('world_frame', 'map')
+        self.world_frame = self.get_parameter('world_frame').value
+        self.declare_parameter('camera_frame_prefix', '')
+        self.camera_frame_prefix = self.get_parameter('camera_frame_prefix').value
+
+        # ArUco parameters
+        self.declare_parameter(
+            'aruco_dict', 'DICT_6X6_250',
+            descriptor=ParameterDescriptor(type=ParameterType.PARAMETER_STRING))
+        self.declare_parameter(
+            'marker_length', 0.26,
+            descriptor=ParameterDescriptor(type=ParameterType.PARAMETER_DOUBLE))
+        aruco_dict_name = self.get_parameter('aruco_dict').value
+        marker_length = self.get_parameter('marker_length').value
+        self.real_aruco_params = ArucoParams(self, aruco_dict_name, marker_length)
+
+        # Camera parameters — discover cam0, cam1, ... from ROS param server
         self.array_of_cameras = []
-        
-        for camera_counter, attr_name in enumerate(cam_attributes):
-            attr_value = getattr(self.imported_cameras_params, attr_name)
-            
-            # Check if the attribute has the 'image_topic' attribute before accessing it
-            if not (hasattr(attr_value, 'image_topic') and hasattr(attr_value, 'image_topic')):
-                self.get_logger().error(f"Skipping attribute '{attr_name}' due to missing 'image_topic' attribute.")
-            else:
-                self.array_of_cameras.append(Camera(self, attr_name, camera_counter, attr_value.image_topic, attr_value.camera_info_topic, self.bridge, self.tf_broadcaster, self.real_aruco_params))
+        camera_counter = 0
+        while True:
+            prefix = f'cam{camera_counter}'
+            self.declare_parameter(f'{prefix}.image_topic', '')
+            self.declare_parameter(f'{prefix}.camera_info_topic', '')
+            image_topic = self.get_parameter(f'{prefix}.image_topic').value
+            info_topic = self.get_parameter(f'{prefix}.camera_info_topic').value
+            if not image_topic:
+                break
+            self.get_logger().info(f"Camera {camera_counter}: image={image_topic}, info={info_topic}")
+            self.array_of_cameras.append(Camera(
+                self, f'cam{camera_counter}', camera_counter,
+                image_topic, info_topic,
+                self.tf_broadcaster, self.real_aruco_params))
+            camera_counter += 1
 
         # periodically check if all cameras are calibrated        
         self.timer = self.create_timer(2.0, self.check_camera_transforms_callback)
@@ -547,17 +554,17 @@ class ExtrinsicCalibrator(Node):
         # Create an array of transforms to be broadcasted
         transforms = []
         
-        # Broadcast the transform between "marker_0" and "map"
+        # Broadcast the transform between "marker_0" and the world frame
         origin_transform = np.eye(4)
 
         t = TransformStamped()
             
         t.header.stamp = self.get_clock().now().to_msg()
         t.header.frame_id = "marker_0"
-        t.child_frame_id = "map"
+        t.child_frame_id = self.world_frame
         
-        translation = tf_transformations.translation_from_matrix(origin_transform)
-        quaternion = tf_transformations.quaternion_from_matrix(origin_transform)
+        translation = origin_transform[:3, 3]
+        quaternion = Rotation.from_matrix(origin_transform[:3, :3]).as_quat()
         
         t.transform.translation.x = translation[0]
         t.transform.translation.y = translation[1]
@@ -579,8 +586,8 @@ class ExtrinsicCalibrator(Node):
                 t.child_frame_id = f"marker_{destination_marker_id}"
                 
                 transform = self.reliable_transform_between_markers_table[self.center_marker][destination_marker_id]
-                translation = tf_transformations.translation_from_matrix(transform)
-                quaternion = tf_transformations.quaternion_from_matrix(transform)
+                translation = transform[:3, 3]
+                quaternion = Rotation.from_matrix(transform[:3, :3]).as_quat()
                 
                 t.transform.translation.x = translation[0]
                 t.transform.translation.y = translation[1]
@@ -600,12 +607,12 @@ class ExtrinsicCalibrator(Node):
             if self.map_to_cameras_transform_table[camera.camera_id] is not None:
                 t = TransformStamped()
                 t.header.stamp = self.get_clock().now().to_msg()
-                t.header.frame_id = "map"
-                t.child_frame_id = camera.camera_name
+                t.header.frame_id = self.world_frame
+                t.child_frame_id = self.camera_frame_prefix + camera.camera_name
                 
                 transform = self.map_to_cameras_transform_table[camera.camera_id]
-                translation = tf_transformations.translation_from_matrix(transform)
-                quaternion = tf_transformations.quaternion_from_matrix(transform)
+                translation = transform[:3, 3]
+                quaternion = Rotation.from_matrix(transform[:3, :3]).as_quat()
                 
                 t.transform.translation.x = translation[0]
                 t.transform.translation.y = translation[1]
@@ -649,24 +656,24 @@ class ExtrinsicCalibrator(Node):
 
 
 class ArucoParams():
-    def __init__(self, node:Node, aruco_params):
-        if hasattr(cv2.aruco, aruco_params.aruco_dict):
-            self.aruco_dict = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, aruco_params.aruco_dict))
+    def __init__(self, node:Node, aruco_dict_name: str, marker_length: float):
+        if hasattr(cv2.aruco, aruco_dict_name):
+            self.aruco_dict = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, aruco_dict_name))
         else:
-            node.get_logger().error(f"cv2.aruco doesn't have a dictionary with the name '{aruco_params.aruco_dict}'")
-        self.marker_length = aruco_params.marker_length
+            node.get_logger().error(f"cv2.aruco doesn't have a dictionary with the name '{aruco_dict_name}'")
+            self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+        self.marker_length = marker_length
 
         
             
 class Camera():
-    def __init__(self, node:Node, camera_name:str, camera_id:int, image_topic:str, camera_info_topic:str, bridge:CvBridge, broadcaster:tf2_ros.TransformBroadcaster, aruco_params:ArucoParams):
+    def __init__(self, node:Node, camera_name:str, camera_id:int, image_topic:str, camera_info_topic:str, broadcaster:tf2_ros.TransformBroadcaster, aruco_params:ArucoParams):
         
         self.node = node
         self.camera_name = camera_name
         self.camera_id = camera_id
         self.image_topic = image_topic
         self.camera_info_topic = camera_info_topic
-        self.bridge = bridge
         self.tf_broadcaster = broadcaster
                
         self.node.get_logger().info(f"Camera {self.camera_name} created.")
@@ -681,8 +688,10 @@ class Camera():
         self.marker_length = aruco_params.marker_length  # length of the marker side in meters (adjust as needed)
 
         # Subscribe to the camera image topic and camera info
-        self.image_sub = self.node.create_subscription(Image, image_topic, self.image_callback, 1)
-        self.camera_info_sub = self.node.create_subscription(CameraInfo, camera_info_topic, self.camera_info_callback, 1)
+        # RealSense publishes with VOLATILE durability
+        qos_info = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.VOLATILE)
+        self.image_sub = self.node.create_subscription(Image, image_topic, self.image_callback, qos_info)
+        self.camera_info_sub = self.node.create_subscription(CameraInfo, camera_info_topic, self.camera_info_callback, qos_info)
         self.cv2_image_publisher = self.node.create_publisher(Image, f"{image_topic}/detected_markers", 10)
         
         self.marker_transforms = {}
@@ -701,7 +710,9 @@ class Camera():
             self.node.get_logger().warn(f"Camera {self.camera_name} parameters not yet received.")
             return
         
-        cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+        # Convert ROS Image to numpy array (cv_bridge replacement for numpy 2.x compat)
+        arr = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, -1)
+        cv_image = arr
 
         # For ArUco detection, you can use the filtered_image directly
         corners, ids, rejected_img_points = self.detector.detectMarkers(cv_image)
@@ -729,7 +740,16 @@ class Camera():
                     # Draw the transform
                     cv2.aruco.drawDetectedMarkers(cv_image, corners, ids)
                     cv2.drawFrameAxes(cv_image, self.camera_matrix, self.dist_coeffs, rvec, tvec, self.marker_length/2)
-                    ros_image = self.bridge.cv2_to_imgmsg(cv_image, "bgr8")
+
+                    # Publish debug image (cv_bridge replacement for numpy 2.x compat)
+                    ros_image = Image()
+                    ros_image.header = msg.header
+                    ros_image.height = cv_image.shape[0]
+                    ros_image.width = cv_image.shape[1]
+                    ros_image.encoding = "bgr8"
+                    ros_image.is_bigendian = 0
+                    ros_image.step = cv_image.shape[1] * cv_image.shape[2] if cv_image.ndim == 3 else cv_image.shape[1]
+                    ros_image.data = cv_image.tobytes()
                     self.cv2_image_publisher.publish(ros_image)
                     
                     # Filter out the already reliable markers
@@ -766,7 +786,7 @@ class Camera():
     def is_precise(self, transforms):
         if all(transform is not None for transform in transforms):
             positions = np.array([t[:3, 3] for t in transforms])
-            rotations = np.array([tf_transformations.euler_from_matrix(t) for t in transforms])
+            rotations = np.array([Rotation.from_matrix(t[:3, :3]).as_euler('xyz') for t in transforms])
 
             position_range = np.ptp(positions, axis=0)
             rotation_range = np.ptp(rotations, axis=0)

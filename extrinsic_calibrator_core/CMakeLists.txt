@@ -12,27 +12,12 @@ find_package(ament_cmake REQUIRED)
 find_package(ament_cmake_python REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclpy REQUIRED)
-find_package(cv_bridge REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 
 find_package(ament_cmake_auto REQUIRED)
 ament_auto_find_build_dependencies()
-
-# find_package(generate_parameter_library REQUIRED)
-# generate_parameter_library(
-#   cpp_camera_topics_parameters # cmake target name for the parameter library
-#   config/camera_topics_parameters.yaml # path to input yaml file
-# )
-
-generate_parameter_module( python_aruco_parameters # cmake target name for the parameter library
-  config/aruco_parameters.yaml # path to input yaml file
-)
-
-generate_parameter_module( python_camera_topics_parameters # cmake target name for the parameter library
-  config/camera_topics_parameters.yaml # path to input yaml file
-)
 
 # PYTHON
 # Install Python modules

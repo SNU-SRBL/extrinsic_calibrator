@@ -52,9 +52,9 @@ import cv2
 # ROS-specific imports
 import rclpy
 from rclpy.node import Node
+from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 
-# Custom parameters
-from extrinsic_calibrator_core.python_aruco_parameters import aruco_params
+# Custom classes
 from extrinsic_calibrator_core.src.extrinsic_calibrator_class import ArucoParams
 
 
@@ -63,10 +63,12 @@ class ArucoMarkerGenerator(Node):
     def __init__(self):
         super().__init__('aruco_marker_generator')
         self.get_logger().info("Aruco Marker Generator Node has started.")
-        
-        aruco_params_listener = aruco_params.ParamListener(self)
-        imported_aruco_params = aruco_params_listener.get_params()
-        self.real_aruco_params = ArucoParams(self,imported_aruco_params)
+
+        self.declare_parameter('aruco_dict', 'DICT_6X6_250')
+        self.declare_parameter('marker_length', 0.26)
+        aruco_dict_name = self.get_parameter('aruco_dict').value
+        marker_length = self.get_parameter('marker_length').value
+        self.real_aruco_params = ArucoParams(self, aruco_dict_name, marker_length)
         
         # Parameters for marker generation
         self.declare_parameter('marker_size', 200)
