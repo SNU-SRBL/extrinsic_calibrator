@@ -149,11 +149,9 @@ class ExtrinsicCalibrator(Node):
         if not self.broadcast_cameras_and_markers_to_world():
             return False
         self.get_logger().info("Extrinsic calibration finished successfully.")
-        self.get_logger().info("The transforms will remain alive while this Node remains too. Hit Ctrl+C to exit")
-        
-        # To keep the Transforms alive
-        while(1):
-            pass
+        self.get_logger().info("Static transforms broadcast. Staying alive for extraction.")
+        # Stay alive — the static transforms need this node to keep spinning
+        # so the middleware can serve them to extract_poses.py later.
         
         
     def generate_is_marker_visible_from_camera_table(self):  
