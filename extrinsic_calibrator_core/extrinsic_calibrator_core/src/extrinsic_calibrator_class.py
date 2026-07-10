@@ -686,9 +686,11 @@ class Camera():
         self.marker_length = aruco_params.marker_length  # length of the marker side in meters (adjust as needed)
 
         # Subscribe to the camera image topic and camera info
-        # RealSense publishes with VOLATILE durability
+        # RealSense publishes image topics with BEST_EFFORT (SENSOR_DATA QoS),
+        # CameraInfo with RELIABLE (DEFAULT QoS). Match both explicitly.
+        qos_img = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT, durability=DurabilityPolicy.VOLATILE)
         qos_info = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.VOLATILE)
-        self.image_sub = self.node.create_subscription(Image, image_topic, self.image_callback, qos_info)
+        self.image_sub = self.node.create_subscription(Image, image_topic, self.image_callback, qos_img)
         self.camera_info_sub = self.node.create_subscription(CameraInfo, camera_info_topic, self.camera_info_callback, qos_info)
         self.cv2_image_publisher = self.node.create_publisher(Image, f"{image_topic}/detected_markers", 10)
         
