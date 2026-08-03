@@ -692,8 +692,9 @@ class Camera():
         qos_info = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.VOLATILE)
         self.image_sub = self.node.create_subscription(Image, image_topic, self.image_callback, qos_img)
         self.camera_info_sub = self.node.create_subscription(CameraInfo, camera_info_topic, self.camera_info_callback, qos_info)
-        self.cv2_image_publisher = self.node.create_publisher(Image, f"{image_topic}/detected_markers", 10)
-        
+        self.cv2_image_publisher = self.node.create_publisher(
+            Image, f"{image_topic}/detected_markers", qos_img)
+
         self.marker_transforms = {}
         self.reliable_marker_transforms = {}
 
@@ -705,23 +706,23 @@ class Camera():
             self.node.get_logger().info(f"Camera {self.camera_name} parameters received.")
 
 
-    def image_callback(self, msg):       
+    def image_callback(self, msg):
         if self.camera_matrix is None or self.dist_coeffs is None:
             self.node.get_logger().warn(f"Camera {self.camera_name} parameters not yet received.")
             return
         
         # Convert ROS Image to numpy array (cv_bridge replacement for numpy 2.x compat)
         arr = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, -1)
-        cv_image = arr
 
         # For ArUco detection, you can use the filtered_image directly
-        corners, ids, rejected_img_points = self.detector.detectMarkers(cv_image)
+        corners, ids, rejected_img_points = self.detector.detectMarkers(arr)
         detected_ids = set()
+        successful_axes = []
         if ids is not None:
             for i, id in enumerate(ids):
                 marker_id = id[0]
                 detected_ids.add(marker_id)
-                
+
                 if marker_id not in self.marker_transforms and marker_id not in self.reliable_marker_transforms:
                     self.marker_transforms[marker_id] = deque(maxlen=30)
 
@@ -729,51 +730,61 @@ class Camera():
                                         [self.marker_length/2,  self.marker_length/2, 0],
                                         [self.marker_length/2, -self.marker_length/2, 0],
                                         [-self.marker_length/2,-self.marker_length/2, 0]], dtype=np.float32)
-                
+
                 success, rvec, tvec = cv2.solvePnP(objPoints, corners[i], self.camera_matrix, self.dist_coeffs)
                 if success:
                     rot_matrix, _ = cv2.Rodrigues(rvec)
                     translation_matrix = np.eye(4)
                     translation_matrix[:3, :3] = rot_matrix
                     translation_matrix[:3, 3] = tvec.flatten()
-                    
-                    # Draw the transform
-                    cv2.aruco.drawDetectedMarkers(cv_image, corners, ids)
-                    cv2.drawFrameAxes(cv_image, self.camera_matrix, self.dist_coeffs, rvec, tvec, self.marker_length/2)
+                    successful_axes.append((rvec, tvec))
 
-                    # Publish debug image (cv_bridge replacement for numpy 2.x compat)
-                    ros_image = Image()
-                    ros_image.header = msg.header
-                    ros_image.height = cv_image.shape[0]
-                    ros_image.width = cv_image.shape[1]
-                    ros_image.encoding = "bgr8"
-                    ros_image.is_bigendian = 0
-                    ros_image.step = cv_image.shape[1] * cv_image.shape[2] if cv_image.ndim == 3 else cv_image.shape[1]
-                    ros_image.data = cv_image.tobytes()
-                    self.cv2_image_publisher.publish(ros_image)
-                    
                     # Filter out the already reliable markers
                     if marker_id in self.reliable_marker_transforms:
                         continue
                     else:
-                        self.marker_transforms[marker_id].append(translation_matrix)
+                        self.marker_transforms[marker_id].append(
+                            translation_matrix)
 
-                # Add None for markers not detected in this frame
-                for marker_id in self.marker_transforms:
-                    if marker_id not in detected_ids:
-                        # Restart the precision of the marker if not seen
-                        # self.marker_transforms[marker_id].append(None)
-                        pass
-                    
-                # iterate through each marker of the marker_transforms dictionary
-                for marker_id, transforms in self.marker_transforms.items():
-                    if len(transforms) == 30:
-                        self.check_precision(marker_id, transforms)
-                
-                # delete all the transforms from the marker_transforms dictionary    
-                for marker_id, transform in self.reliable_marker_transforms.items():
-                    if marker_id in self.marker_transforms:
-                        del self.marker_transforms[marker_id]
+            # Render, copy, and publish at most once per input frame, and only
+            # when the debug publisher has subscribers.
+            if self.cv2_image_publisher.get_subscription_count() > 0:
+                cv_image = arr.copy()
+                cv2.aruco.drawDetectedMarkers(cv_image, corners, ids)
+                for rvec, tvec in successful_axes:
+                    cv2.drawFrameAxes(
+                        cv_image, self.camera_matrix, self.dist_coeffs,
+                        rvec, tvec, self.marker_length/2)
+
+                # Publish debug image (cv_bridge replacement for numpy
+                # 2.x compat)
+                ros_image = Image()
+                ros_image.header = msg.header
+                ros_image.height = cv_image.shape[0]
+                ros_image.width = cv_image.shape[1]
+                ros_image.encoding = "bgr8"
+                ros_image.is_bigendian = 0
+                ros_image.step = (
+                    cv_image.shape[1] * cv_image.shape[2]
+                    if cv_image.ndim == 3 else cv_image.shape[1])
+                ros_image.data = cv_image.tobytes()
+                self.cv2_image_publisher.publish(ros_image)
+
+        # Evict non-reliable marker queues for markers absent from this frame
+        # so a transient detection miss cannot block calibration forever; any
+        # queue reaching 30 therefore required 30 consecutive detections.
+        for marker_id in list(self.marker_transforms.keys()):
+            if marker_id not in detected_ids:
+                del self.marker_transforms[marker_id]
+
+        # Evaluate precision and move reliable entries exactly once after the
+        # complete frame has been processed, not inside the per-marker loop.
+        for marker_id, transforms in list(self.marker_transforms.items()):
+            if len(transforms) == 30:
+                self.check_precision(marker_id, transforms)
+        for marker_id in list(self.reliable_marker_transforms.keys()):
+            if marker_id in self.marker_transforms:
+                del self.marker_transforms[marker_id]
 
 
     def check_precision(self, marker_id, transform):
@@ -806,5 +817,4 @@ class Camera():
                     self.node.get_logger().warn(f"Camera {self.camera_name}: Marker {marker_id} is not reliable, yet")
             return False
         
-            
             

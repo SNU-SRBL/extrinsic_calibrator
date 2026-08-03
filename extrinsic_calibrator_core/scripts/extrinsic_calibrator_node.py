@@ -72,7 +72,8 @@ def main(args=None):
         # Cleanup
         executor.shutdown()
         extrinsic_calibrator_node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
